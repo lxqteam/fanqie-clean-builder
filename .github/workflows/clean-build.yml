@@ -76,9 +76,22 @@ jobs:
             --push-config config/push-removal.json \
             --permissions-keep config/permissions-keep.txt
 
+      - name: Debug source structure
+        run: |
+          echo "=== Source dir structure ==="
+          ls -la _build/source/ | head -20
+          echo "=== Smali dirs ==="
+          ls -d _build/source/smali* 2>/dev/null || echo "no smali dirs"
+          echo "=== Smali file count ==="
+          find _build/source -name "*.smali" | wc -l
+          echo "=== Manifest check ==="
+          head -5 _build/source/AndroidManifest.xml 2>/dev/null || echo "Manifest missing"
+          echo "=== Commented lines count ==="
+          grep -r '# \[cross-ref-stub\]' _build/source/smali* 2>/dev/null | wc -l
+
       - name: Rebuild APK
         run: |
-          /opt/apktool b _build/source -o _build/fanqie-unsigned.apk 2>&1 | tail -5
+          /opt/apktool b _build/source -o _build/fanqie-unsigned.apk 2>&1
           ls -lh _build/fanqie-unsigned.apk || exit 1
 
       - name: Sign APK (V2+V3 via apksigner)
