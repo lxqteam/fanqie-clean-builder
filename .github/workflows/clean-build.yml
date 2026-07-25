@@ -1,8 +1,10 @@
 name: Fanqie Clean Build Pipeline
+
 on: workflow_dispatch
+
 env:
   MODDED_URL: 'https://github.com/callacat/gha-build-farm/releases/download/fanqie-mod-7.2.4.19/fanqie_mod_7.2.4.19.apk'
-  OFFICIAL_URL: 'https://cloud.dsdog.tk/d/google/temp/%E7%95%AA%E8%8C%84%E5%85%8D%E8%B4%B9%E5%B0%8F%E8%AF%B4_7.2.4.32.apk?sign=xUavME2Rt4Vf1FTbCppPq7sU8bRUFh29hrbIhdsXon4=:0'
+  OFFICIAL_URL: 'https://imtt.dd.qq.com/sjy.20025/sjy.00004/70F9FEB84B66FE6D/16891/apk/DBE1BEE002458448D1E0A321B6EBD7BA.apk?fsname=com.dragon.read_7.2.9.32.apk&csr=6a4e'
   JAVA_TOOL_OPTIONS: '-Xmx6g'
 
 jobs:
@@ -42,16 +44,34 @@ jobs:
             --push-config config/push-removal.json \
             --permissions-keep config/permissions-keep.txt
 
-      - name: Strip DPatch tracking (keep CreatorProxy + DATA + ۧۤۤ)
+      # ===== FIX: 不再直接删除 AppFactory，而是安全清理 DPatch 追踪 =====
+      # 原版直接 rm AppFactory.smali 会导致 Lancet AOP 注入的 CreatorProxy 调用断裂
+      # 修改为: 只删除 Copyright.smali，保留 AppFactory 和 CreatorProxy 的路由表
+      - name: Strip DPatch tracking (keep AppFactory + CreatorProxy + DATA)
         run: |
-          rm -f $(find _build/source -path "*/pandora/core/AppFactory.smali" ! -path "*\$DATA*") 2>/dev/null || true
+          # 只删除 Copyright.smali（DPatch 版权追踪）
           rm -f $(find _build/source -path "*/pandora/core/Copyright.smali") 2>/dev/null || true
-          echo "Remaining:"
+          # 注意：不再删除 AppFactory.smali，避免 Lancet AOP 路由断裂
+          echo "Remaining pandora/core:"
           find _build/source -path "*/pandora/core/*" -name "*.smali" 2>/dev/null || echo "none"
 
+      # ===== NEW: 清理已删除包的交叉引用 =====
+      # 在删除广告/推送 SDK 包后，剩余 smali 中可能仍引用这些已删除的类
+      # 将引用已删除包的方法体替换为安全的空操作桩
+      - name: Stub cross-references to deleted packages
+        run: |
+          python3 scripts/stub-cross-references.py \
+            --source _build/source \
+            --ad-config config/ad-removal.json \
+            --push-config config/push-removal.json
+
+      # ===== FIX: 保留原始 ComponentFactory 或使用 pandora.core.AppFactory =====
+      # 原版替换为 CoreComponentFactory 会导致 pandora AOP 框架路由断裂
+      # 修改为: 跳过 ComponentFactory 替换，保留原始值
       - name: Modify Manifest
         run: |
-          python3 scripts/modify-manifest.py --component-factory "androidx.core.app.CoreComponentFactory" \
+          python3 scripts/modify-manifest.py \
+            --skip-component-factory \
             --manifest _build/source/AndroidManifest.xml \
             --push-config config/push-removal.json \
             --permissions-keep config/permissions-keep.txt
@@ -85,13 +105,21 @@ jobs:
           retention-days: 90
 
       # =============== IN-JOB DIFF (same job, no cross-artifact download) ===============
-
       - name: Download official APK for diff
         run: |
           curl -sL -o /tmp/official.apk "$OFFICIAL_URL"
-          ls -lh /tmp/official.apk
+          # FIX: 验证下载的文件是否为有效的 APK/ZIP
+          if file /tmp/official.apk | grep -q "Zip archive"; then
+            echo "OFFICIAL_OK=true" >> $GITHUB_ENV
+            echo "  ✓ Official APK downloaded successfully"
+            ls -lh /tmp/official.apk
+          else
+            echo "OFFICIAL_OK=false" >> $GITHUB_ENV
+            echo "  ⚠️ Official APK download failed (not a valid zip), skipping diff"
+          fi
 
       - name: Decode official + clean for diff
+        if: env.OFFICIAL_OK == 'true'
         run: |
           /opt/apktool d /tmp/official.apk -o _smali/official -f &
           P1=$!
@@ -104,6 +132,7 @@ jobs:
         timeout-minutes: 12
 
       - name: Run diff harvester
+        if: env.OFFICIAL_OK == 'true'
         run: |
           python3 scripts/smali_diff_harvester.py \
             --official _smali/official \
@@ -112,6 +141,7 @@ jobs:
             --report _diff/report.json
 
       - name: Show diff summary
+        if: env.OFFICIAL_OK == 'true'
         run: python3 scripts/verify-diff-summary.py _diff/report.json
 
       - name: Upload diff report
@@ -123,7 +153,6 @@ jobs:
           retention-days: 30
 
   # =============== B: STRUCTURAL CHECK (fast, no emulator needed) ===============
-
   structural-check:
     needs: build
     runs-on: ubuntu-22.04
