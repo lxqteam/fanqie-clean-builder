@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """stub-cross-references.py — 清理已删除包在剩余 smali 中的交叉引用。
 
-当广告/推送 SDK 包目录被整包删除后，剩余代码中仍可能通过
-invoke-static / invoke-virtual / invoke-direct / invoke-interface
-引用已删除包中的类和方法。这会导致运行时 ClassNotFoundException 或
-NoSuchMethodError，进而引发应用闪退。
+策略 (v2): 精确注释 invoke 指令行，而非替换整个方法体。
+v1 版本过于激进，将引用已删除包的整个方法替换为空桩，
+会破坏关键生命周期方法 (如 onCreate, onResume 等)，导致构建失败。
 
-本脚本扫描所有剩余 smali 文件，找到引用已删除包的 invoke 指令，
-将包含这些 invoke 的方法体替换为安全的空操作桩（根据返回类型返回正确值）。
+本脚本只做两件事:
+  1. 注释掉 invoke 指令中对已删除包的调用（前面加 # ）
+  2. 注释掉紧随其后的 move-result* 指令，并插入安全默认值
+  
+对于 void 调用，只需注释 invoke 行。
+对于有返回值的调用，同时注释 move-result 行并插入默认值。
 
 用法:
   python3 scripts/stub-cross-references.py \
@@ -52,59 +55,33 @@ def build_deleted_prefixes(ad_config: dict, push_config: dict) -> list[str]:
     return sorted(prefixes)
 
 # ---------------------------------------------------------------------------
-# 方法签名解析
+# 核心扫描与精确注释
 # ---------------------------------------------------------------------------
 
-RE_METHOD_SIG = re.compile(
-    r'\.method\s+(?:static\s+)?(.+?)\s+\S+\(([^)]*)\)(\S+)',
-    re.DOTALL,
-)
+# 匹配 move-result 指令
+RE_MOVE_RESULT = re.compile(r'^(\s*)(move-result\w*)\s')
 
-def _parse_return_type(sig: str) -> str:
-    sig = sig.strip()
-    if sig == 'V':
-        return 'void'
-    if sig == 'Z':
-        return 'boolean'
-    if sig in ('I', 'B', 'S', 'C'):
-        return 'int'
-    if sig == 'J':
-        return 'wide'
-    return 'object'
+# 匹配 invoke 的返回类型 (从方法描述符中提取)
+RE_INVOKE_RET = re.compile(r'->\w+\([^)]*\)(\w+)\s*$')
 
-def _make_safe_stub(method_line: str) -> str:
-    """根据方法签名生成类型安全的空操作桩。"""
-    sig_match = RE_METHOD_SIG.search(method_line)
-    if sig_match:
-        ret_type = _parse_return_type(sig_match.group(3))
-    else:
-        ret_type = 'void'
+def _is_deleted_ref(line: str, deleted_prefixes: list[str]) -> str | None:
+    """检查一行代码是否引用了已删除包。返回匹配的前缀或 None。"""
+    for prefix in deleted_prefixes:
+        if prefix in line:
+            return prefix
+    return None
 
-    if ret_type == 'void':
-        return f"{method_line}\n    .registers 1\n    return-void\n.end method"
-    elif ret_type == 'boolean':
-        return f"{method_line}\n    .registers 2\n    const/4 v0, 0x1\n    return v0\n.end method"
-    elif ret_type == 'int':
-        return f"{method_line}\n    .registers 2\n    const/4 v0, 0x0\n    return v0\n.end method"
-    elif ret_type == 'wide':
-        return f"{method_line}\n    .registers 2\n    const-wide/16 v0, 0x0\n    return-wide v0\n.end method"
-    else:
-        return f"{method_line}\n    .registers 2\n    const/4 v0, 0x0\n    return-object v0\n.end method"
-
-# ---------------------------------------------------------------------------
-# 核心扫描与打桩
-# ---------------------------------------------------------------------------
-
-# 匹配 invoke 指令中的类型引用
-# invoke-virtual {v0, v1}, Lcom/luckycat/sdk/Init;->init()V
-RE_INVOKE = re.compile(r'invoke-\w+\s+.*?(L[\w/]+);')
+def _get_invoke_return_type(line: str) -> str | None:
+    """从 invoke 指令中提取返回类型。"""
+    m = RE_INVOKE_RET.search(line)
+    return m.group(1) if m else None
 
 def stub_cross_references(source: Path, deleted_prefixes: list[str]) -> tuple[int, int]:
-    """扫描所有 smali 文件，找到引用已删除包的方法并打桩。
-    返回 (文件修改数, 方法打桩数)。
+    """精确注释掉 invoke 指令中对已删除包的引用。
+    返回 (文件修改数, 指令注释数)。
     """
     files_modified = 0
-    methods_stubbed = 0
+    lines_commented = 0
 
     for smali_dir in sorted(source.glob("smali*")):
         if not smali_dir.is_dir():
@@ -115,7 +92,7 @@ def stub_cross_references(source: Path, deleted_prefixes: list[str]) -> tuple[in
             except Exception:
                 continue
 
-            # 快速预检：检查文件是否包含任何已删除包前缀
+            # 快速预检
             has_ref = False
             for prefix in deleted_prefixes:
                 if prefix in content:
@@ -126,53 +103,83 @@ def stub_cross_references(source: Path, deleted_prefixes: list[str]) -> tuple[in
 
             lines = content.split("\n")
             out: list[str] = []
-            i = 0
             file_modified = False
+            skip_next = False  # 标记跳过已处理的 move-result 行
 
-            while i < len(lines):
-                stripped = lines[i].strip()
-
-                if not stripped.startswith(".method "):
-                    out.append(lines[i])
-                    i += 1
+            for idx, line in enumerate(lines):
+                # 如果上一轮标记了跳过
+                if skip_next:
+                    skip_next = False
                     continue
 
-                # 收集整个 method block
-                method_lines: list[str] = [lines[i]]
-                j = i + 1
-                while j < len(lines) and lines[j].strip() != ".end method":
-                    method_lines.append(lines[j])
-                    j += 1
-                if j < len(lines):
-                    end_line = lines[j]
-                else:
-                    end_line = ".end method"
+                stripped = line.strip()
 
-                method_body = "\n".join(method_lines)
+                # 空行和标签直接输出
+                if not stripped or stripped.startswith(".") or stripped == ":":
+                    out.append(line)
+                    continue
 
-                # 检查方法体是否引用了任何已删除包
-                ref_found = None
-                for prefix in deleted_prefixes:
-                    if prefix in method_body:
-                        ref_found = prefix
-                        break
+                # 已经被注释过的行直接输出
+                if stripped.startswith("#"):
+                    out.append(line)
+                    continue
 
-                if ref_found is not None:
-                    out.append(_make_safe_stub(method_lines[0]))
-                    methods_stubbed += 1
+                # 检查是否是 invoke 指令且引用了已删除包
+                ref = _is_deleted_ref(stripped, deleted_prefixes)
+                if ref and "invoke-" in stripped:
+                    ret_type = _get_invoke_return_type(stripped)
+
+                    # 注释掉 invoke 行
+                    out.append(f"# [cross-ref-stub] {line}")
+                    lines_commented += 1
                     file_modified = True
-                    print(f"  ✓ 打桩 {safe_relative(smali_file, source)} (引用: {ref_found})")
-                else:
-                    out.extend(method_lines)
-                    out.append(end_line)
 
-                i = j + 1
+                    # 检查下一行是否是 move-result
+                    if idx + 1 < len(lines):
+                        next_line = lines[idx + 1]
+                        next_stripped = next_line.strip()
+                        mr_match = RE_MOVE_RESULT.match(next_stripped)
+
+                        if mr_match and not next_stripped.startswith("#"):
+                            mr_indent = mr_match.group(1)
+
+                            if ret_type == 'V':
+                                # void 方法不应该有 move-result，直接跳过
+                                skip_next = True
+                            elif ret_type == 'Z':
+                                # boolean: 插入 true
+                                out.append(f"# [cross-ref-stub] {next_line}")
+                                out.append(f"{mr_indent}const/4 v0, 0x1")
+                                lines_commented += 1
+                                skip_next = True
+                            elif ret_type in ('J', 'D'):
+                                # wide/double: 插入 0L
+                                out.append(f"# [cross-ref-stub] {next_line}")
+                                out.append(f"{mr_indent}const-wide/16 v0, 0x0")
+                                lines_commented += 1
+                                skip_next = True
+                            elif ret_type and (ret_type.startswith('L') or ret_type.startswith('[')):
+                                # object: 插入 null
+                                out.append(f"# [cross-ref-stub] {next_line}")
+                                out.append(f"{mr_indent}const/4 v0, 0x0")
+                                lines_commented += 1
+                                skip_next = True
+                            else:
+                                # int/byte/short/char: 插入 0
+                                out.append(f"# [cross-ref-stub] {next_line}")
+                                out.append(f"{mr_indent}const/4 v0, 0x0")
+                                lines_commented += 1
+                                skip_next = True
+                    continue
+
+                out.append(line)
 
             if file_modified:
                 smali_file.write_text("\n".join(out), encoding="utf-8")
                 files_modified += 1
+                print(f"  ✓ 处理 {safe_relative(smali_file, source)}")
 
-    return files_modified, methods_stubbed
+    return files_modified, lines_commented
 
 # ---------------------------------------------------------------------------
 # main
@@ -180,7 +187,7 @@ def stub_cross_references(source: Path, deleted_prefixes: list[str]) -> tuple[in
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="清理已删除包在剩余 smali 中的交叉引用",
+        description="清理已删除包在剩余 smali 中的交叉引用 (精确注释模式)",
     )
     parser.add_argument("--source", required=True, help="apktool 反编译根目录")
     parser.add_argument("--ad-config", required=True, help="广告删除配置 (JSON)")
@@ -196,13 +203,13 @@ def main() -> int:
     push_config = load_json(args.push_config)
 
     deleted_prefixes = build_deleted_prefixes(ad_config, push_config)
-    print(f"=== 清理交叉引用 ===")
+    print(f"=== 清理交叉引用 (v2: 精确注释模式) ===")
     print(f"  → 已删除包前缀 ({len(deleted_prefixes)}):")
     for p in deleted_prefixes:
         print(f"      {p}")
 
-    files_modified, methods_stubbed = stub_cross_references(source, deleted_prefixes)
-    print(f"\n  → 修改 {files_modified} 个文件，打桩 {methods_stubbed} 个方法")
+    files_modified, lines_commented = stub_cross_references(source, deleted_prefixes)
+    print(f"\n  → 修改 {files_modified} 个文件，注释 {lines_commented} 条指令")
     print("\n✓ 完成")
     return 0
 
